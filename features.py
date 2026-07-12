@@ -1,6 +1,8 @@
 import os
 import numpy as np
 from skimage import io, color, transform, measure, filters
+from skimage import morphology
+from skimage import feature
 
 
 def make_one_hot_key(class_index, num_classes):
@@ -9,17 +11,72 @@ def make_one_hot_key(class_index, num_classes):
     return tuple(key.tolist())
 
 
-def image_db_to_arrays(image_db):
-    X = []
-    y = []
+def infer_image_shape_from_vector(vector):
+    size = int(vector.size)
+    side = int(np.sqrt(size))
+    if side * side == size:
+        return side, side
+
+    if size % 3 == 0:
+        side = int(np.sqrt(size // 3))
+        if side * side * 3 == size:
+            return side, side, 3
+
+    raise ValueError(f'Impossible de reconstruire une image a partir dun vecteur de taille {size}')
+
+
+def vector_to_image(vector):
+    return np.asarray(vector).reshape(infer_image_shape_from_vector(np.asarray(vector)))
+
+
+def build_image_db(root_dir, as_gray=True, max_per_class=None):
+    classes = [d for d in sorted(os.listdir(root_dir)) if os.path.isdir(os.path.join(root_dir, d))]
+    image_db = {make_one_hot_key(ci, len(classes)): [] for ci in range(len(classes))}
+
+    for ci, cname in enumerate(classes):
+        folder = os.path.join(root_dir, cname)
+        files = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp'))
+        ]
+        if max_per_class:
+            files = files[:max_per_class]
+
+        for file_path in files:
+            try:
+                img = load_image(file_path, as_gray=as_gray)
+            except Exception:
+                continue
+            image_db[make_one_hot_key(ci, len(classes))].append(np.asarray(img).flatten())
+
+    return image_db, classes
+
+
+def image_db_to_arrays(image_db, image_shape=(32,32), return_separate=False):
+    Xp = []
+    ys = []
+
     for one_hot_key, image_vectors in image_db.items():
         label = int(np.argmax(one_hot_key))
         for image_vector in image_vectors:
-            X.append(image_vector)
-            y.append(label)
-    if not X:
+            img = vector_to_image(image_vector)
+            pix = roi_pixels_feature(img, image_shape=image_shape)
+            Xp.append(pix)
+            ys.append(label)
+
+    if not Xp:
+        if return_separate:
+            return None, None, None
         return None, None
-    return np.vstack(X), np.array(y, dtype=int)
+
+    Xp = np.vstack(Xp)
+    y = np.array(ys, dtype=int)
+
+    if return_separate:
+        return Xp, y
+
+    return Xp, y
 
 
 def load_image(path, as_gray=True):
@@ -29,14 +86,44 @@ def load_image(path, as_gray=True):
     return img
 
 
+def get_canny_edges(img):
+    """Return Canny edges for a grayscale image normalized in [0, 1]."""
+    imgf = img.astype(float)
+    if imgf.max() > 1.0:
+        imgf = imgf / 255.0
+    imgf = filters.gaussian(imgf, sigma=0.8)
+    return feature.canny(imgf, sigma=1.2)
+
+
 def extract_mask_and_crop(img, thresh=None):
     # img expected grayscale in [0,1] or [0,255]
     imgf = img.astype(float)
     if imgf.max() > 1.0:
         imgf = imgf / 255.0
-    if thresh is None:
-        thresh = filters.threshold_otsu(imgf)
-    mask = imgf > thresh
+
+    # Smooth first to stabilize edge detection.
+    imgf = filters.gaussian(imgf, sigma=0.8)
+
+    # Canny contours, then morphological cleanup to recover filled shape regions.
+    edges = feature.canny(imgf, sigma=1.2)
+    edges = morphology.binary_closing(edges, morphology.disk(1))
+    edges = morphology.binary_dilation(edges, morphology.disk(1))
+
+    # Fill enclosed contours (shape interiors) while keeping external background out.
+    fill_area = max(64, int(0.5 * edges.size))
+    mask = morphology.remove_small_holes(edges, area_threshold=fill_area)
+
+    # Remove tiny artifacts.
+    min_area = max(8, int(0.001 * mask.size))
+    mask = morphology.remove_small_objects(mask, min_size=min_area)
+    mask = morphology.binary_closing(mask, morphology.disk(1))
+
+    # Fallback if edge-based mask is empty.
+    if not np.any(mask):
+        if thresh is None:
+            thresh = filters.threshold_otsu(imgf)
+        mask = imgf > thresh
+
     # bounding box
     props = measure.regionprops(measure.label(mask.astype(int)))
     if not props:
@@ -61,24 +148,6 @@ def roi_pixels_feature(img, image_shape=(32,32)):
     return resized.flatten()
 
 
-def extra_features(img):
-    mask, cropped, props = extract_mask_and_crop(img)
-    if props is None:
-        return np.array([0, 0.0])
-    # number of shapes
-    lab = measure.label(mask.astype(int))
-    num_shapes = lab.max()
-    # eccentricity of the largest shape
-    regions = measure.regionprops(lab)
-    if not regions:
-        ecc = 0.0
-    else:
-        areas = [r.area for r in regions]
-        largest = regions[int(np.argmax(areas))]
-        ecc = float(largest.eccentricity)
-    return np.array([num_shapes, ecc])
-
-
 def load_dataset(
     root_dir,
     image_shape=(32,32),
@@ -89,22 +158,26 @@ def load_dataset(
     show_debug_images=False,
     return_image_db=False,
 ):
-    """Parcourt les sous-dossiers de root_dir; chaque sous-dossier est une classe.
-    Retourne: X_pixels (N x D), X_extra (N x E), y (N,), class_names list.
-    Si return_image_db=True, retourne aussi image_db avec clef one-hot et valeur liste de vecteurs combines.
+    """Construit dabord une image_db one-hot -> vecteurs dimage, puis extrait les features.
+    Retourne: X_pixels (N x D), y (N,), class_names list.
+    Si return_image_db=True, retourne aussi image_db avec clef one-hot et valeur liste de vecteurs dimage bruts.
     """
-    Xp = []
-    Xe = []
-    ys = []
+    image_db, class_names = build_image_db(root_dir, as_gray=as_gray, max_per_class=max_per_class)
+    Xp, y = image_db_to_arrays(image_db, image_shape=image_shape, return_separate=True)
+
+    if Xp is None:
+        return None, None, None, []
+
     sample_paths = []
     sample_class_names = []
-    class_names = []
-    classes = [d for d in sorted(os.listdir(root_dir)) if os.path.isdir(os.path.join(root_dir, d))]
-    image_db = {make_one_hot_key(ci, len(classes)): [] for ci in range(len(classes))}
-    for ci, cname in enumerate(classes):
-        class_names.append(cname)
+    sample_raw_vectors = []
+    for ci, cname in enumerate(class_names):
         folder = os.path.join(root_dir, cname)
-        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp'))]
+        files = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp'))
+        ]
         if max_per_class:
             files = files[:max_per_class]
         for f in files:
@@ -112,20 +185,9 @@ def load_dataset(
                 img = load_image(f, as_gray=as_gray)
             except Exception:
                 continue
-            pix = roi_pixels_feature(img, image_shape=image_shape)
-            extras = extra_features(img)
-            combined = np.hstack([pix, extras])
-            Xp.append(pix)
-            Xe.append(extras)
-            ys.append(ci)
             sample_paths.append(f)
             sample_class_names.append(cname)
-            image_db[make_one_hot_key(ci, len(classes))].append(combined)
-    if len(Xp) == 0:
-        return None, None, None, []
-    Xp = np.vstack(Xp)
-    Xe = np.vstack(Xe)
-    y = np.array(ys, dtype=int)
+            sample_raw_vectors.append(np.asarray(img).flatten())
 
     if debug_samples and debug_samples > 0:
         rng = np.random.RandomState(debug_seed)
@@ -138,21 +200,29 @@ def load_dataset(
             print(f'Classe: {sample_class_names[idx]} (label={y[idx]})')
             print(f'One-hot: {make_one_hot_key(y[idx], len(class_names))}')
             print(f'Fichier: {sample_paths[idx]}')
+            print(f'Raw[0:10]: {np.round(sample_raw_vectors[idx][:10], 4)}')
             print(f'Pixels[0:10]: {np.round(Xp[idx][:10], 4)}')
-            print(f'Extra features: {np.round(Xe[idx], 4)}')
 
             if show_debug_images:
                 import matplotlib.pyplot as plt
 
                 img = load_image(sample_paths[idx], as_gray=as_gray)
-                plt.figure(figsize=(3, 3))
+                edges = get_canny_edges(img)
+
+                plt.figure(figsize=(7, 3))
+                plt.subplot(1, 2, 1)
                 cmap = 'gray' if getattr(img, 'ndim', 2) == 2 else None
                 plt.imshow(img, cmap=cmap)
-                plt.title(sample_class_names[idx])
+                plt.title(f'Original - {sample_class_names[idx]}')
+                plt.axis('off')
+
+                plt.subplot(1, 2, 2)
+                plt.imshow(edges, cmap='gray')
+                plt.title('Canny')
                 plt.axis('off')
                 plt.show()
 
     if return_image_db:
-        return Xp, Xe, y, class_names, image_db
+        return Xp, y, class_names, image_db
 
-    return Xp, Xe, y, class_names
+    return Xp, y, class_names
