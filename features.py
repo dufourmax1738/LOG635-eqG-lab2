@@ -3,7 +3,7 @@ import numpy as np
 from skimage import io, color, transform, measure, filters
 from skimage import morphology
 from skimage import feature
-
+from abc import ABC, abstractmethod
 
 def make_one_hot_key(class_index, num_classes):
     key = np.zeros(num_classes, dtype=int)
@@ -227,62 +227,90 @@ def load_dataset(
 
     return Xp, y, class_names
 
+# Polymorphisme des algorithmes d'activation pour les couches du réseau de neurones
+class activation_functions(ABC):
+    @abstractmethod
+    def function(self, x):
+        pass
+
+    @abstractmethod
+    def derivative(self, x):
+        pass
+
+    def backward_delta(self, x, output_error):
+        return output_error * self.derivative(x)
+
+# Implementation de la fonction d'activation ReLU
+class relu(activation_functions):
+    def function(self, x):
+        return np.maximum(0, x)
+
+    def derivative(self, x):
+        return (x > 0).astype(float)
+
+# Implementation de la fonction d'activation Softmax
+class softmax(activation_functions):
+    def function(self, x):
+        exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+        return exp_x / np.sum(exp_x, axis=1, keepdims=True)
+
+    def derivative(self, x):
+        # Not used directly for output layer when combined with cross-entropy.
+        s = self.function(x)
+        return s * (1 - s)
+
+    def backward_delta(self, x, output_error):
+        # With softmax + cross-entropy, upstream gradient is already simplified.
+        return output_error
+
+# Classe représentant un réseau de neurones entièrement connecté avec plusieurs couches cachées
 class NeuralNetwork():
-    def __init__(self, input_size, hidden_size, output_size, learning_rate=0.01):
+    def __init__(self, input_size, hidden_size, output_size, hidden_layers, learning_rate=0.01):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.weights_input_hidden = np.random.randn(input_size, hidden_size)
-        self.bias_hidden = np.ones((1, hidden_size))
-        self.weights_hidden_output = np.random.randn(hidden_size, output_size)
-        self.bias_output = np.ones((1, output_size))
+        self.trainable_layers = []
+
+        if hidden_layers < 1:
+            raise ValueError('hidden_layers must be >= 1')
+        
+        # On ajoute des couches cachées avec ReLU et une couche de sortie avec Softmax
+        self.trainable_layers.append(Layer(input_size, hidden_size, activation=relu()))
+        for _ in range(hidden_layers - 1):
+            self.trainable_layers.append(Layer(hidden_size, hidden_size, activation=relu()))
+        self.trainable_layers.append(Layer(hidden_size, output_size, activation=softmax()))
         self.learning_rate = learning_rate
 
-    def relu(self, z):
-        return np.maximum(0, z)
-    
-    def relu_derivative(self, z):
-        return (z > 0).astype(float)
-    
-    def softmax(self, z):
-        exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
-        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
-    
+    # Passe dans le réseau pour obtenir les prédictions
     def forward(self, X):
-        self.hidden_input = np.dot(X, self.weights_input_hidden) + self.bias_hidden
-        self.hidden_output = self.relu(self.hidden_input)
-        self.final_input = np.dot(self.hidden_output, self.weights_hidden_output) + self.bias_output
-        self.final_output = self.softmax(self.final_input)
-        return self.final_output
-    
+        for layer in self.trainable_layers:
+            X = layer.forward(X)
+        return X
+
+    # Calcul de la perte d'entropie croisée pour les étiquettes vraies et les prédictions
     def entropy_loss(self, y_true, y_pred):
         eps = np.finfo(float).eps
 
-        # Support class-index labels (shape: [m]) and one-hot labels (shape: [m, C]).
+        # Transformation des étiquettes vraies en one-hot si elles sont fournies sous forme d'indices
         if y_true.ndim == 1:
             m = y_true.shape[0]
             correct_class_probs = y_pred[np.arange(m), y_true]
             return -np.mean(np.log(correct_class_probs + eps))
 
         return -np.mean(np.sum(y_true * np.log(y_pred + eps), axis=1))
+
     
     def backward(self, X, y_true, y_pred):
-        m = X.shape[0]
+        m = y_pred.shape[0]
         y_true_one_hot = np.zeros_like(y_pred)
         y_true_one_hot[np.arange(m), y_true] = 1
 
-        output_error = (y_pred - y_true_one_hot)
-        output_delta = np.dot(self.hidden_output.T, output_error)/m
-        output_bias_delta = np.sum(output_error, axis=0, keepdims=True)/m
+        # Gradient of cross-entropy wrt logits when output uses softmax.
+        output_error = (y_pred - y_true_one_hot) / m
 
-        hidden_error = np.dot(output_error, self.weights_hidden_output.T) * self.relu_derivative(self.hidden_input)
-        hidden_delta = np.dot(X.T, hidden_error)/m
-        hidden_bias_delta = np.sum(hidden_error, axis=0, keepdims=True)/m
-
-        self.weights_hidden_output -= self.learning_rate * output_delta
-        self.bias_output -= self.learning_rate * output_bias_delta
-        self.weights_input_hidden -= self.learning_rate * hidden_delta
-        self.bias_hidden -= self.learning_rate * hidden_bias_delta
+        error = output_error
+        for layer in reversed(self.trainable_layers):
+            error = layer.backward(error, self.learning_rate)
 
     def train(self, X, y, nb_iteration=1000):
         for i in range(nb_iteration):
@@ -291,6 +319,44 @@ class NeuralNetwork():
             self.backward(X, y, y_pred)
             if (i + 1) % 100 == 0:
                 print(f"Iteration {i + 1}/{nb_iteration}, Loss: {loss:.4f}")
+
     def predict(self, X):
         y_pred = self.forward(X)
         return np.argmax(y_pred, axis=1)
+
+
+class Layer():
+    def __init__(self, input_size, output_size, activation=relu()):
+        self.input_size = input_size
+        self.output_size = output_size
+        self.activation = activation if activation is not None else relu()
+
+        # He init for ReLU layers, Xavier-like init for output layer.
+        if isinstance(self.activation, relu):
+            scale = np.sqrt(2.0 / input_size)
+        else:
+            scale = np.sqrt(1.0 / input_size)
+
+        self.weights = np.random.randn(input_size, output_size) * scale
+        self.bias = np.zeros((1, output_size))
+
+    def forward(self, X):
+        self.input = X
+        self.z = np.dot(X, self.weights) + self.bias
+        self.output = self.activation.function(self.z)
+        return self.output
+
+    def backward(self, output_error, learning_rate):
+        delta = self.activation.backward_delta(self.z, output_error)
+
+        weights_error = np.dot(self.input.T, delta)
+        bias_error = np.sum(delta, axis=0, keepdims=True)
+
+        # Return error for the previous layer before updating current weights.
+        previous_error = np.dot(delta, self.weights.T)
+
+        # Update weights and biases.
+        self.weights -= learning_rate * weights_error
+        self.bias -= learning_rate * bias_error
+
+        return previous_error
